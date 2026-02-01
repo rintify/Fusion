@@ -1,0 +1,257 @@
+--[[--
+Easy Round Box (Resolve 19 Fusion)
+Behavior:
+  - Draws a box with entry/exit animation.
+  - Uses FFI-casted integer coordinates for GetPixel/SetPixel to ensure stability.
+--]]--
+
+local ffi = require("ffi")
+
+FuRegisterClass("EasyRoundBox", CT_Tool, {
+    REGS_Name = "Easy Round Box",
+    REGS_Category = "Fuses",
+    REGS_OpIconString = "ERB",
+    REGS_OpDescription = "Draws a rounded box with entry/exit animation",
+    REG_TimeVariant = true,
+})
+
+InImage = self:AddInput("Input", "Input", {
+    LINKID_DataType = "Image",
+    LINK_Main = 1,
+})
+
+InCenter = self:AddInput("Center", "Center", {
+    LINKID_DataType = "Point",
+    INPID_InputControl = "OffsetControl",
+    INPID_PreviewControl = "CrosshairControl",
+    INP_DefaultX = 0.5,
+    INP_DefaultY = 0.5,
+})
+
+InWidth = self:AddInput("Width", "Width", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "SliderControl",
+    INP_Default = 0.3,
+    INP_MaxAllowed = 1.0,
+})
+
+InHeight = self:AddInput("Height", "Height", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "SliderControl",
+    INP_Default = 0.3,
+    INP_MaxAllowed = 1.0,
+})
+
+InRadius = self:AddInput("Corner Radius", "CornerRadius", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "SliderControl",
+    INP_Default = 0.05,
+    INP_MaxScale = 0.5,
+})
+
+InThickness = self:AddInput("Thickness", "Thickness", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "SliderControl",
+    INP_Default = 0.01,
+})
+
+InRed = self:AddInput("Red", "Red", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "ColorControl",
+    INP_Default = 1.0,
+    IC_ControlGroup = 1,
+    IC_ControlID = 0,
+})
+
+InGreen = self:AddInput("Green", "Green", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "ColorControl",
+    INP_Default = 0.0,
+    IC_ControlGroup = 1,
+    IC_ControlID = 1,
+})
+
+InBlue = self:AddInput("Blue", "Blue", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "ColorControl",
+    INP_Default = 0.0,
+    IC_ControlGroup = 1,
+    IC_ControlID = 2,
+})
+
+InAlpha = self:AddInput("Alpha", "Alpha", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "ColorControl",
+    INP_Default = 0.8,
+    IC_ControlGroup = 1,
+    IC_ControlID = 3,
+})
+
+InAnimDur = self:AddInput("Anim Duration", "AnimDuration", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "ScrewControl",
+    INP_Default = 15,
+    INP_Integer = true,
+})
+
+OutImage = self:AddOutput("Output", "Output", {
+    LINKID_DataType = "Image",
+    LINK_Main = 1,
+})
+
+function Process(req)
+    if jit and jit.off then jit.off() end
+    
+    local img = InImage:GetValue(req)
+    if img == nil then
+        OutImage:Set(req, nil)
+        if jit and jit.on then jit.on() end
+        return
+    end
+    
+    local out = img:CopyOf()
+    
+    local center = InCenter:GetValue(req)
+    local cx = center and center.X or 0.5
+    local cy = center and center.Y or 0.5
+    
+    local wVal = InWidth:GetValue(req).Value
+    local hVal = InHeight:GetValue(req).Value
+    local rVal = InRadius:GetValue(req).Value
+    local tVal = InThickness:GetValue(req).Value
+    local dur = InAnimDur:GetValue(req).Value
+    
+    local cR = InRed:GetValue(req).Value
+    local cG = InGreen:GetValue(req).Value
+    local cB = InBlue:GetValue(req).Value
+    local cA = InAlpha:GetValue(req).Value
+    
+    -- Animation Logic
+    local currentScale = 1.0
+    local startF = 0
+    local endF = 100
+    local c = self.Comp
+    if c then
+        if c.GlobalStart then
+             startF = c.GlobalStart
+             endF = c.GlobalEnd
+        elseif c.RenderStart then
+             startF = c.RenderStart
+             endF = c.RenderEnd
+        end
+    end
+    
+    local time = req.Time - startF
+    local clipLen = endF - startF
+    
+    if clipLen > 0 then
+        local animFrames = math.floor(dur + 0.5)
+        if animFrames < 1 then animFrames = 1 end
+        local p = 1.0
+        if time < animFrames then p = time / animFrames 
+        elseif time > clipLen - animFrames then p = (clipLen - time) / animFrames end
+        if p < 0 then p = 0 end
+        if p > 1 then p = 1 end
+        currentScale = (1.0 - math.cos(p * math.pi)) / 2.0
+    end
+    
+    if currentScale < 0.001 then
+        OutImage:Set(req, out)
+        if jit and jit.on then jit.on() end
+        return
+    end
+
+    local finalW = wVal * currentScale
+    local finalH = hVal * currentScale
+    local imgW = out.Width
+    local imgH = out.Height
+    local aspect = imgW / imgH
+    local boxX = (finalW * aspect) / 2.0
+    local boxY = finalH / 2.0
+    local pad = tVal + rVal + 0.02
+    
+    local minX = cx - (finalW/2) - pad
+    local maxX = cx + (finalW/2) + pad
+    local minY = cy - (finalH/2) - pad
+    local maxY = cy + (finalH/2) + pad
+    
+    local sx = math.floor(minX * imgW)
+    local sy = math.floor(minY * imgH)
+    local ex = math.ceil(maxX * imgW)
+    local ey = math.ceil(maxY * imgH)
+    
+    if sx < 0 then sx = 0 end
+    if sy < 0 then sy = 0 end
+    if ex > imgW-1 then ex = imgW-1 end
+    if ey > imgH-1 then ey = imgH-1 end
+    
+    if sx >= ex or sy >= ey then
+        OutImage:Set(req, out)
+        if jit and jit.on then jit.on() end
+        return
+    end
+    
+    -- Pixel Processing Loop use FFI cast for exact types
+    -- Prepare buffer Pixel object if needed
+    local pObj = nil
+    if Pixel then pObj = Pixel() end
+    
+    for y = sy, ey do
+        local cy_int = ffi.cast("int", y)
+        local normY = (y + 0.5) / imgH
+        local dy = math.abs(normY - cy) - boxY + rVal
+        
+        for x = sx, ex do
+             local cx_int = ffi.cast("int", x)
+             local normX = (x + 0.5) / imgW
+             local dx = math.abs((normX - cx) * aspect) - boxX + rVal
+             
+             local m = dx > dy and dx or dy
+             local ldx = dx > 0 and dx or 0
+             local ldy = dy > 0 and dy or 0
+             local len = math.sqrt(ldx*ldx + ldy*ldy)
+             local dist = (m > 0 and 0 or m) + len - rVal
+             local bDist = math.abs(dist) - (tVal / 2.0)
+             
+             if bDist < 0 then
+                 -- Get Pixel Safe
+                 local pR, pG, pB, pA = 0, 0, 0, 0
+                 
+                 -- Try different GetPixel signatures safely
+                 local success = false
+                 
+                 -- 1. Try passing Pixel object
+                 if pObj then
+                     local ok = pcall(out.GetPixel, out, cx_int, cy_int, pObj)
+                     if ok then
+                         pR, pG, pB, pA = pObj.R, pObj.G, pObj.B, pObj.A
+                         success = true
+                     end
+                 end
+                 
+                 -- 2. Try Standard Return
+                 if not success then
+                     local ok, r, g, b, a = pcall(out.GetPixel, out, cx_int, cy_int)
+                     if ok and r then
+                         pR, pG, pB, pA = r, g, b, a
+                         success = true
+                     end
+                 end
+                 
+                 if success then
+                     local alpha = cA
+                     local nR = cR * alpha + pR * (1-alpha)
+                     local nG = cG * alpha + pG * (1-alpha)
+                     local nB = cB * alpha + pB * (1-alpha)
+                     local nA = pA + alpha * (1-pA)
+                     
+                     -- Try SetPixel
+                     local okSet = pcall(out.SetPixel, out, cx_int, cy_int, nR, nG, nB, nA)
+                 end
+             end
+        end
+    end
+
+    OutImage:Set(req, out)
+    if jit and jit.on then jit.on() end
+end

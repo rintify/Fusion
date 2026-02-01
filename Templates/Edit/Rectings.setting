@@ -1,0 +1,89 @@
+{
+	Tools = ordered() {
+		Rectings = GroupOperator {
+			Inputs = ordered() {
+				Input1 = InstanceInput {
+					SourceOp = "Rectangle1",
+					Source = "Center",
+				},
+				Input2 = InstanceInput {
+					SourceOp = "Rectangle1",
+					Source = "Width",
+					Default = 0.953,
+				},
+				Input3 = InstanceInput {
+					SourceOp = "Rectangle1",
+					Source = "Height",
+					Default = 0.929,
+				}
+			},
+			Outputs = {
+				MainOutput1 = InstanceOutput {
+					SourceOp = "MediaOut1",
+					Source = "Output",
+				}
+			},
+			ViewInfo = GroupInfo { Pos = { 0, 0 } },
+			Tools = ordered() {
+				Rectangle1 = RectangleMask {
+					Inputs = {
+						Filter = Input { Value = FuID { "Fast Gaussian" }, },
+						SoftEdge = Input { Value = 0.001, },
+						BorderWidth = Input { Value = 0.008, },
+						Solid = Input { Value = 0, },
+						WritePosition = Input { Value = 0.118, },
+						WriteLength = Input {
+							SourceOp = "Rectangle1Length",
+							Source = "Value",
+						},
+						MaskWidth = Input { Value = 1920, },
+						MaskHeight = Input { Value = 1080, },
+						PixelAspect = Input { Value = { 1, 1 }, },
+						UseFrameFormatSettings = Input { Value = 1, },
+						ClippingMode = Input { Value = FuID { "None" }, },
+						Width = Input { Value = 0.953, },
+						Height = Input { Value = 0.929, },
+						CornerRadius = Input { Value = 0.142, }
+					},
+					ViewInfo = OperatorInfo { Pos = { 128.667, 15.5757 } },
+				},
+				Rectangle1Length = BezierSpline {
+					SplineColor = { Red = 141, Green = 167, Blue = 243 },
+					CtrlWZoom = false,
+					KeyFrames = {
+						[0] = { 0, RH = { 2.33333333333333, 0.333333333333333 }, Flags = { Linear = true } },
+						[7] = { 1, LH = { 4.66666666666667, 0.666666666666667 }, Flags = { Linear = true } }
+					}
+				},
+				Background1 = Background {
+					Inputs = {
+						EffectMask = Input {
+							SourceOp = "Rectangle1",
+							Source = "Mask",
+						},
+						Width = Input { Value = 1920, },
+						Height = Input { Value = 1080, },
+						UseFrameFormatSettings = Input { Value = 1, },
+						["Gamut.SLogVersion"] = Input { Value = FuID { "SLog2" }, },
+						TopLeftRed = Input { Value = 0.9254901960784, },
+						TopLeftGreen = Input { Value = 0.4039215686275, },
+						TopLeftBlue = Input { Value = 0.4549019607843, }
+					},
+					ViewInfo = OperatorInfo { Pos = { 259.334, 37.6667 } },
+				},
+				MediaOut1 = MediaOut {
+					CtrlWZoom = false,
+					Inputs = {
+						Index = Input { Value = "0", },
+						Input = Input {
+							SourceOp = "Background1",
+							Source = "Output",
+						}
+					},
+					ViewInfo = OperatorInfo { Pos = { 440, 49.5 } },
+				}
+			},
+		}
+	},
+	ActiveTool = "Rectings"
+}

@@ -1,0 +1,220 @@
+--[[--
+Easy Auto Zoom (Resolve 19 Fusion)
+Behavior:
+  - Focus point is FIXED (no animation of focus during zoom)
+  - Zoom is animated by time
+  - Focus point stays at screen center during zoom (pan occurs implicitly)
+
+Implementation:
+  - Center (Offset) fixed at (0.5, 0.5)
+  - Pivot (Axis) fixed at Focus (fx, fy)
+  - Scale animated
+
+Includes:
+  - Swap XY / Invert Y toggles (coordinate-system differences)
+--]]--
+
+FuRegisterClass("EasyAutoZoom", CT_Tool, {
+    REGS_Name = "Easy Auto Zoom",
+    REGS_Category = "Fuses",
+    REGS_OpIconString = "EAZ",
+    REGS_OpDescription = "Zoom with fixed focus pivot; focus stays centered",
+    REG_TimeVariant = true,
+})
+
+InImage = nil
+InFocus = nil
+InZoomLevel = nil
+InAnimDur = nil
+InSwapXY = nil
+InInvertY = nil
+OutImage = nil
+
+local function toNumber(v, default)
+    if v == nil then return default end
+    local tv = type(v)
+
+    if tv == "number" then return v end
+    if tv == "string" then return tonumber(v) or default end
+
+    if tv == "table" then
+        if type(v.Value) == "number" then return v.Value end
+        if type(v[1]) == "number" then return v[1] end
+    end
+
+    local ok1, n = pcall(function() return tonumber(v) end)
+    if ok1 and type(n) == "number" then return n end
+
+    local ok2, val = pcall(function() return v.Value end)
+    if ok2 and type(val) == "number" then return val end
+
+    return default
+end
+
+local function clamp(x, a, b)
+    if x < a then return a end
+    if x > b then return b end
+    return x
+end
+
+local function getCompRangeFrames(selfTool)
+    local c = selfTool.Comp or comp
+    if c == nil then return 0, 100 end
+
+    local ok, attrs = pcall(function() return c:GetAttrs() end)
+    if ok and type(attrs) == "table" then
+        local gs = attrs.COMPN_GlobalStart
+        local ge = attrs.COMPN_GlobalEnd
+        if type(gs) == "number" and type(ge) == "number" and ge > gs then
+            return gs, ge
+        end
+
+        local rs = attrs.COMPN_RenderStart
+        local re = attrs.COMPN_RenderEnd
+        if type(rs) == "number" and type(re) == "number" and re > rs then
+            return rs, re
+        end
+    end
+
+    if c.RenderStart ~= nil and c.RenderEnd ~= nil and c.RenderEnd > c.RenderStart then
+        return c.RenderStart, c.RenderEnd
+    end
+
+    return 0, 100
+end
+
+local function easeInOutSine(p)
+    return (1.0 - math.cos(p * math.pi)) / 2.0
+end
+
+function Create()
+    InImage = self:AddInput("Input", "Input", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    -- This focus point is NOT animated by the tool; it is read as-is.
+    InFocus = self:AddInput("Focus", "Focus", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INPID_PreviewControl = "CrosshairControl",
+        INP_DefaultX = 0.5,
+        INP_DefaultY = 0.5,
+    })
+
+    InZoomLevel = self:AddInput("Zoom Level", "ZoomLevel", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 1.5,
+        INP_MinAllowed = 1.0,
+        INP_MaxAllowed = 5.0,
+    })
+
+    InAnimDur = self:AddInput("Anim Duration (Frames)", "AnimDuration", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_Default = 15,
+        INP_Integer = true,
+        INP_MinAllowed = 1,
+        INP_MaxAllowed = 300,
+    })
+
+    InSwapXY = self:AddInput("Swap XY", "SwapXY", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Default = 0,
+    })
+
+    InInvertY = self:AddInput("Invert Y", "InvertY", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Default = 0,
+    })
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+end
+
+function Process(req)
+    local img = InImage:GetValue(req)
+    if img == nil then return end
+
+    local focus = InFocus:GetValue(req)
+    local fx = clamp(toNumber(focus and focus.X, 0.5), 0.0, 1.0)
+    local fy = clamp(toNumber(focus and focus.Y, 0.5), 0.0, 1.0)
+
+    local swapxy = toNumber(InSwapXY:GetValue(req), 0) >= 0.5
+    local inverty = toNumber(InInvertY:GetValue(req), 0) >= 0.5
+
+    if swapxy then fx, fy = fy, fx end
+    if inverty then fy = 1.0 - fy end
+
+    local zoom_max = math.max(1.0, toNumber(InZoomLevel:GetValue(req), 1.5))
+
+    local anim_frames = math.floor(toNumber(InAnimDur:GetValue(req), 15) + 0.5)
+    if anim_frames < 1 then anim_frames = 1 end
+
+    local start_f, end_f = getCompRangeFrames(self)
+    local clip_len = end_f - start_f
+    if clip_len < 1 then
+        OutImage:Set(req, img)
+        return
+    end
+
+    local t = req.Time - start_f
+    t = clamp(t, 0, clip_len)
+
+    local max_anim = math.floor(clip_len / 2)
+    if max_anim < 1 then max_anim = 1 end
+    if anim_frames > max_anim then anim_frames = max_anim end
+
+    local progress = 0.0
+    local out_start = clip_len - anim_frames
+
+    if clip_len <= anim_frames * 2 then
+        local half = clip_len / 2.0
+        if half < 1e-6 then
+            progress = 0.0
+        elseif t <= half then
+            progress = t / half
+        else
+            progress = (clip_len - t) / half
+        end
+    else
+        if t < anim_frames then
+            progress = t / anim_frames
+        elseif t >= out_start then
+            progress = (clip_len - t) / anim_frames
+        else
+            progress = 1.0
+        end
+    end
+
+    progress = clamp(progress, 0.0, 1.0)
+    local ease = easeInOutSine(progress)
+
+    local scale = 1.0 + (zoom_max - 1.0) * ease
+
+    -- ★重要：Focusは固定（ズーム途中で動かさない）
+    local out = img:Transform(nil, {
+        XF_UseNormalized = 1,
+
+        -- Keep screen center fixed
+        XF_XOffset = 0.5,
+        XF_YOffset = 0.5,
+
+        -- Pivot is the focus point (fixed)
+        XF_XAxis = fx,
+        XF_YAxis = fy,
+
+        XF_XSize = scale,
+        XF_YSize = scale,
+
+        XF_Angle = 0,
+        XF_EdgeMode = "Duplicate",
+    })
+
+    OutImage:Set(req, out)
+end
