@@ -213,79 +213,107 @@ def clean_audio_output_dir(audio_output_dir):
     print(f"🧹 既存音声をクリーンアップ: {removed}件")
 
 
-def delete_audio_track_by_name(timeline, track_name):
-    """指定名のオーディオトラックを削除する（存在しない場合は何もしない）"""
-    count = timeline.GetTrackCount("audio") or 0
-    for i in range(1, count + 1):
-        name = timeline.GetTrackName("audio", i)
-        if name == track_name:
-            try:
-                timeline.DeleteTrack("audio", i)
-                print(f"🧹 オーディオトラック削除: {track_name} (トラック {i})")
-            except Exception as e:
-                print(f"⚠️ オーディオトラック削除に失敗: {track_name} ({e})")
-            break
 
-
-def remove_imported_audio(mediapool, timeline, audio_output_dir, track_prefix=None):
-    """タイムラインとメディアプールにある生成済み音声を掃除する（現在のタイムラインのフォルダのみ）"""
-    removed_tl = 0
-    removed_pool = 0
-
-    # タイムライン上のクリップ削除（指定prefixのトラックを対象）
-    track_count = timeline.GetTrackCount("audio") or 0
-    track_indices = []
+def scan_and_clean_timeline_tracks(timeline, track_prefix, expected_audios):
+    """
+    タイムライン上の既存オーディオクリップをスキャンする。
     
-    if track_prefix:
-        # prefixに合致するトラックのみ対象
-        for i in range(1, track_count + 1):
-            name = timeline.GetTrackName("audio", i)
-            if name and name.startswith(track_prefix):
-                track_indices.append(i)
-    else:
-        track_indices = list(range(1, track_count + 1))
+    Args:
+        timeline: Timelineオブジェクト
+        track_prefix: スキャン対象のトラック名プレフィックス
+        expected_audios: { (hash, start_frame): SubtitleInfo, ... } の辞書。
+                         ここにあるものは維持(Keep)対象。
+    
+    Returns:
+        track_occupancy: { track_index: [(start, end), ...] }  (維持されたクリップの配置状況)
+        kept_clips: set((hash, start_frame)) (維持されたクリップのキー)
+        tracks_to_check: list(track_index) (対象トラックのインデックスリスト)
+    """
+    print("🔍 タイムラインの既存クリップをスキャン中...")
+    
+    track_count = timeline.GetTrackCount("audio") or 0
+    track_occupancy = {}
+    kept_clips = set()
+    tracks_to_check = []
+    
+    items_to_delete = []
 
-    for t_idx in track_indices:
-        audio_items = timeline.GetItemListInTrack("audio", t_idx) or []
-        for item in audio_items:
-            name = item.GetName() or ""
+    # 対象トラックをリストアップ
+    for i in range(1, track_count + 1):
+        name = timeline.GetTrackName("audio", i)
+        if name and name.startswith(track_prefix):
+            tracks_to_check.append(i)
+            track_occupancy[i] = []
 
-            # タイムラインアイテムからメディアプールアイテムを取得し、そこからパスを取る
-            clip = item.GetMediaPoolItem() if hasattr(item, "GetMediaPoolItem") else None
-            props = clip.GetClipProperty() if clip and hasattr(clip, "GetClipProperty") else {}
-            path = props.get("File Path", "") if isinstance(props, dict) else ""
+    # 各トラックのアイテムをチェック
+    for t_idx in tracks_to_check:
+        items = timeline.GetItemListInTrack("audio", t_idx) or []
+        for item in items:
+            item_name = item.GetName()
+            start_frame = item.GetStart()
+            duration = item.GetDuration()
+            end_frame = start_frame + duration
+            
+            # ファイル名からハッシュを抽出
+            # item_name は "voice_abcdefg..." や "voice_abcdefg.wav" の可能性あり
+            base_name = os.path.splitext(item_name)[0]  # .wav除去
+            
+            match = re.match(r"voice_([a-f0-9]+)", base_name)
+            if match:
+                audio_hash = match.group(1)
+                key = (audio_hash, start_frame)
+                
+                # キープ条件:
+                # 1. 期待されるリストに含まれている (ハッシュと開始位置が一致)
+                # 2. まだ同位置でキープされていない (重複排除)
+                if key in expected_audios and key not in kept_clips:
+                    # 維持する！
+                    kept_clips.add(key)
+                    track_occupancy[t_idx].append((start_frame, end_frame))
+                else:
+                    items_to_delete.append(item)
+            else:
+                items_to_delete.append(item)
 
-            # 現在のタイムライン用フォルダの音声のみ削除
-            if name.startswith("voice_") and path.startswith(audio_output_dir):
-                try:
-                    item.Delete()
-                    removed_tl += 1
-                except Exception as e:
-                    print(f"⚠️ タイムライン音声削除に失敗: {name} ({e})")
+    # 不要アイテムの削除実行
+    if items_to_delete:
+        print(f"🧹 タイムライン上の古い/不要なクリップを {len(items_to_delete)} 個 削除中...")
+        timeline.DeleteClips(items_to_delete)
 
-    # メディアプール上のクリップ削除（現在のタイムライン用フォルダのみ）
-    root = mediapool.GetRootFolder()
-    clips = root.GetClipList()
-    targets = []
+    return track_occupancy, kept_clips
+
+
+def scan_and_clean_mediapool(target_bin, required_hashes):
+    """
+    メディアプール(Bin)内のクリップをスキャン。
+    必要なハッシュを持つものは辞書で返す。
+    不要なものは削除リストへ。
+    """
+    print("🔍 メディアプールの既存クリップをスキャン中...")
+    
+    clips = target_bin.GetClipList() or []
+    media_map = {} # hash -> MediaPoolItem
+    items_to_delete = []
+    
     for clip in clips:
-        props = clip.GetClipProperty()
-        name = props.get("Clip Name", "") if props else ""
-        path = props.get("File Path", "") if props else ""
-        # 現在のタイムライン用フォルダの音声のみ削除
-        if name.startswith("voice_") and path.startswith(audio_output_dir):
-            targets.append(clip)
+        name = clip.GetName()
+        match = re.search(r"voice_([a-f0-9]+)", name)
+        
+        if match:
+            h = match.group(1)
+            if h in required_hashes:
+                media_map[h] = clip
+            else:
+                items_to_delete.append(clip)
+        else:
+            if name.startswith("voice_"):
+                items_to_delete.append(clip)
 
-    if targets:
-        try:
-            mediapool.DeleteClips(targets)
-            removed_pool = len(targets)
-        except Exception as e:
-            print(f"⚠️ メディアプール音声削除に失敗: {e}")
+    return media_map, items_to_delete
 
-    print(f"🧹 タイムライン掃除: {removed_tl}件 / メディアプール掃除: {removed_pool}件")
 
 # ==========================================
-# 🎬 メイン処理（書き出し不要Ver.）
+# 🎬 メイン処理（差分更新対応Ver.）
 # ==========================================
 def get_or_create_bin(mediapool, bin_name):
     """Master内に指定名のbinを探すか、なければ作成して返す"""
@@ -312,36 +340,41 @@ def get_or_create_bin(mediapool, bin_name):
         return root
 
 
-def remove_imported_audio_from_bin(mediapool, target_bin, audio_output_dir):
-    """指定binにある生成済み音声を掃除する"""
-    removed_pool = 0
+def remove_imported_audio(mediapool, timeline, audio_output_dir, track_prefix=None):
+    """(旧) タイムラインとメディアプールにある生成済み音声を掃除する"""
+    # Forceモード用互換関数。中身は以前と同じロジックだが、ここでは簡略化のためscan関数を流用...
+    # しようとしたが、既存ロジック通り完全に消す方が安全。
     
-    clips = target_bin.GetClipList() or []
-    targets = []
-    for clip in clips:
-        props = clip.GetClipProperty()
-        name = props.get("Clip Name", "") if props else ""
-        path = props.get("File Path", "") if props else ""
-        # 現在のタイムライン用フォルダの音声のみ削除
-        if name.startswith("voice_") and path.startswith(audio_output_dir):
-            targets.append(clip)
+    removed_tl = 0
+    
+    track_count = timeline.GetTrackCount("audio") or 0
+    track_indices = []
+    if track_prefix:
+        for i in range(1, track_count + 1):
+            name = timeline.GetTrackName("audio", i)
+            if name and name.startswith(track_prefix):
+                track_indices.append(i)
+    else:
+        track_indices = list(range(1, track_count + 1))
 
-    if targets:
-        try:
-            mediapool.DeleteClips(targets)
-            removed_pool = len(targets)
-        except Exception as e:
-            print(f"⚠️ メディアプール音声削除に失敗: {e}")
+    for t_idx in track_indices:
+        audio_items = timeline.GetItemListInTrack("audio", t_idx) or []
+        for item in audio_items:
+            name = item.GetName() or ""
+            # パス検査等は省略し、track_prefix下のvoice_は全消し
+            if name.startswith("voice_"):
+                try:
+                    item.Delete()
+                    removed_tl += 1
+                except: pass
 
-    print(f"🧹 メディアプール(bin)掃除: {removed_pool}件")
-    return removed_pool
-
+    # メディアプールの方はBin単位で消すのでここでは何もしない(呼び出し元で制御)
+    print(f"🧹 タイムライン全掃除: {removed_tl}件")
 
 
 def main(force_regen=False):
-    print("✨ 自動音声生成（Direct Mode）起動っ！ ///")
+    print("✨ 自動音声生成（Diff Update Mode）起動っ！ ///")
 
-    
     resolve = get_resolve()
     if not resolve: return
 
@@ -353,168 +386,172 @@ def main(force_regen=False):
         print("❌ タイムラインが開いてないよ！")
         return
 
-    # タイムライン名を取得
     timeline_name = timeline.GetName()
     print(f"📹 現在のタイムライン: {timeline_name}")
 
-    # タイムラインごとの出力ディレクトリを決定
     audio_output_dir = get_audio_output_dir(timeline_name)
-
-    # 保存先フォルダ作成
     if not os.path.exists(audio_output_dir):
         os.makedirs(audio_output_dir)
-        print(f"📁 出力フォルダ作成: {audio_output_dir}")
 
-        print(f"📁 出力フォルダ作成: {audio_output_dir}")
-
-    # 強制再生成の場合のみ、既存の音声ファイルを全部消す
-    if force_regen:
-        print("🔥 強制再生成モード: 既存のキャッシュを削除するよ！")
-        clean_audio_output_dir(audio_output_dir)
-    else:
-        print("♻️ キャッシュモード: 変更がないファイルは使い回すよ！")
-
-    # 1. 字幕トラックを探して、クリップを直接引っこ抜く！
-    # "subtitle" はAPIで字幕トラックを指定するキーワードだよ
-    print("🔍 タイムラインから字幕を直接読んでるよ...")
-    
-    # トラックタイプ "subtitle" の 1番目のトラックのアイテムを取得
+    # 1. 必要な字幕データの収集
+    print("� 字幕トラックを解析中...")
     subtitle_items = timeline.GetItemListInTrack("subtitle", 1)
-    
     if not subtitle_items:
         print("⚠️ 字幕トラックが見つからないか、空っぽだよぉ...")
         return
 
-    total_items = len(subtitle_items)
-    print(f"✅ {total_items}個の字幕クリップを発見！")
+    expected_audios = {}   # (hash, start_frame) -> info
+    required_hashes = set()
+    entry_order = [] 
 
-    # Master内にタイムライン名のbinを作成または取得
+    total_subs = len(subtitle_items)
+    for i, item in enumerate(subtitle_items):
+        text = item.GetName()
+        if not text: continue
+        
+        text_hash = get_audio_hash(text, SPEAKER_ID, SPEED_SCALE)
+        start_frame = item.GetStart()
+        duration = item.GetDuration()
+        
+        info = {
+            "text": text,
+            "hash": text_hash,
+            "start_frame": start_frame,
+            "duration": duration, 
+            "index": i
+        }
+        
+        key = (text_hash, start_frame)
+        expected_audios[key] = info
+        required_hashes.add(text_hash)
+        entry_order.append(key)
+
+    print(f"✅ {len(entry_order)}個の字幕データを検出")
+
+    # 2. クリーンアップ & スキャン
     target_bin = get_or_create_bin(mediapool, timeline_name)
 
-    # 既存の生成済み音声（タイムライン/メディアプール）を掃除（現在のタイムラインのみ）
-    remove_imported_audio(mediapool, timeline, audio_output_dir, track_prefix=TARGET_AUDIO_TRACK_NAME)
-    remove_imported_audio_from_bin(mediapool, target_bin, audio_output_dir)
-
-    # 「字幕音声」「字幕音声2」等のトラックを全て削除
-    delete_audio_tracks_by_prefix(timeline, TARGET_AUDIO_TRACK_NAME)
-
-    # 実行ごとのタイムスタンプ（ファイル名に付与）
-    run_tag = time.strftime("%Y%m%d_%H%M%S")
-
-    # クリップ情報を収集（まず全ての音声を生成・確認）
-    clips_info = []  # [(start_frame, duration, media_item), ...]
-
-    for i, item in enumerate(subtitle_items):
-        # Resolve 18以降、字幕クリップのGetName()は「中身のテキスト」を返すはず！
-        text = item.GetName()
+    if force_regen:
+        print("🔥 強制再生成モード: 全てクリアします")
+        remove_imported_audio(mediapool, timeline, audio_output_dir, track_prefix=TARGET_AUDIO_TRACK_NAME)
         
-        # もし空っぽならスキップ
-        if not text:
-            continue
-
-        progress = format_progress(i + 1, total_items)
+        # Bin内全消去
+        clips = target_bin.GetClipList() or []
+        if clips: mediapool.DeleteClips(clips)
+            
+        delete_audio_tracks_by_prefix(timeline, TARGET_AUDIO_TRACK_NAME)
+        clean_audio_output_dir(audio_output_dir)
         
-        # ハッシュ値を計算してファイル名を決定
-        text_hash = get_audio_hash(text, SPEAKER_ID, SPEED_SCALE)
-        wav_filename = f"voice_{text_hash}.wav"
-        wav_path = os.path.join(audio_output_dir, wav_filename)
-
-        # キャッシュチェック
-        file_exists = os.path.exists(wav_path)
-        
-        if not force_regen and file_exists:
-            print(f"♻️ [{progress}] キャッシュ発見！使い回すね: {text[:10]}...")
-            
-            # binをカレントフォルダに設定してからインポート
-            mediapool.SetCurrentFolder(target_bin)
-            imported_items = mediapool.ImportMedia([wav_path])
-            
-            if imported_items:
-                media_item = imported_items[0]
-                
-                # 配置情報
-                start_frame = item.GetStart() # タイムライン上の開始フレーム
-                duration = get_clip_duration_frames(media_item, timeline)
-                
-                clips_info.append((start_frame, duration, media_item))
-                continue
-            else:
-                 print(f"⚠️ [{progress}] キャッシュのインポートに失敗… 再生成するね")
-
-        # 再生成が必要な場合
-        print(f"🎙️ [{progress}] 生成中: {text[:10]}...")
-
-        # 音声生成
-        if generate_voicevox_audio(text, wav_path):
-            # binをカレントフォルダに設定してからインポート
-            mediapool.SetCurrentFolder(target_bin)
-            imported_items = mediapool.ImportMedia([wav_path])
-            
-            if imported_items:
-                media_item = imported_items[0]
-                
-                # 配置情報（計算不要！アイテムから直接Startを取得できるの♡）
-                start_frame = item.GetStart() # タイムライン上の開始フレーム
-                duration = get_clip_duration_frames(media_item, timeline)
-                
-                clips_info.append((start_frame, duration, media_item))
-                print(f"✅ [{progress}] 音声クリップ作成OK (長さ: {duration}フレーム)")
-            else:
-                print(f"⚠️ [{progress}] インポートに失敗したよ…")
-        else:
-            print(f"⚠️ [{progress}] 音声生成に失敗したよ…")
-
-    # 2. クリップの重なりを考慮してトラックを割り当て
-    if clips_info:
-        print("🎞️ クリップの重なりをチェックしてトラックを割り当てるよ...")
-        
-        # トラック占有情報: {logical_track_num: [(start, end), ...]}
-        track_occupancy = {1: []}  # 最初は1トラック分用意
-        
-        # クリップごとにトラックを割り当て
-        clips_to_append = []
-        track_indices = {}  # {logical_track_num: actual_track_index}
-        
-        for (start_frame, duration, media_item) in clips_info:
-            end_frame = start_frame + duration
-            
-            # 配置可能なトラックを探す
-            assigned_track = find_available_track(track_occupancy, start_frame, end_frame)
-            
-            if assigned_track is None:
-                # 新しいトラックが必要
-                new_track_num = max(track_occupancy.keys()) + 1
-                track_occupancy[new_track_num] = []
-                assigned_track = new_track_num
-            
-            # 占有情報を更新
-            track_occupancy[assigned_track].append((start_frame, end_frame))
-            
-            # トラックを作成（まだ作ってなければ）
-            if assigned_track not in track_indices:
-                track_name = get_track_name_for_index(TARGET_AUDIO_TRACK_NAME, assigned_track)
-                track_indices[assigned_track] = get_or_create_audio_track(timeline, track_name)
-            
-            clip_info = {
-                "mediaPoolItem": media_item,
-                "startFrame": 0,
-                "endFrame": duration,
-                "trackIndex": track_indices[assigned_track],
-                "recordFrame": start_frame
-            }
-            clips_to_append.append(clip_info)
-        
-        # 使用したトラック数を表示
-        num_tracks = len(track_indices)
-        if num_tracks > 1:
-            print(f"📊 {num_tracks}個のトラックを使用（重なりがあったため追加トラックを作成したよ！）")
-        
-        # まとめて配置
-        print("🎞️ タイムラインに並べてるよ...")
-        mediapool.AppendToTimeline(clips_to_append)
-        print("🎉 完了！！ だーりん、全部自動でできたよっ！褒めて♡")
+        track_occupancy = {}
+        kept_timeline_clips = set()
+        media_map = {}
     else:
-        print("⚠️ 生成できるものがなかったよぉ...")
+        # Diffモード
+        track_occupancy, kept_timeline_clips = scan_and_clean_timeline_tracks(
+            timeline, TARGET_AUDIO_TRACK_NAME, expected_audios
+        )
+        
+        media_map, pool_items_to_delete = scan_and_clean_mediapool(target_bin, required_hashes)
+        
+        if pool_items_to_delete:
+            print(f"🧹 メディアプールの不要アイテムを {len(pool_items_to_delete)} 個 削除中...")
+            mediapool.DeleteClips(pool_items_to_delete)
+
+    # 3. 生成 & 配置準備
+    clips_to_append = []
+    
+    # 既存状況の整理
+    # track_occupancyには既存アイテムのフレーム範囲が入ってる
+    
+    processed_count = 0
+    total_count = len(entry_order)
+
+    for key in entry_order:
+        processed_count += 1
+        (h, start) = key
+        info = expected_audios[key]
+        text = info["text"]
+        
+        # 既にタイムラインにあるなら配置不要
+        if key in kept_timeline_clips:
+            continue
+            
+        progress = format_progress(processed_count, total_count)
+        
+        # メディアプールの確認
+        media_item = media_map.get(h)
+        wav_filename = f"voice_{h}.wav"
+        wav_path = os.path.join(audio_output_dir, wav_filename)
+        
+        # なければ生成・インポート
+        if not media_item:
+            if not os.path.exists(wav_path) or force_regen:
+                print(f"🎙️ [{progress}] 生成中: {text[:10]}...")
+                if not generate_voicevox_audio(text, wav_path):
+                    print(f"⚠️ 生成失敗: {text[:10]}")
+                    continue
+            else:
+                print(f"♻️ [{progress}] ファイル再利用: {text[:10]}...")
+
+            mediapool.SetCurrentFolder(target_bin)
+            imported = mediapool.ImportMedia([wav_path])
+            if imported:
+                media_item = imported[0]
+                media_map[h] = media_item
+            else:
+                print(f"⚠️ インポート失敗: {wav_path}")
+                continue
+        
+        # 配置計算
+        audio_duration = get_clip_duration_frames(media_item, timeline)
+        end_frame = start + audio_duration
+        
+        # トラック割り当て
+        target_track_idx = None
+        known_track_indices = sorted(track_occupancy.keys())
+        
+        for t_idx in known_track_indices:
+            occupied = track_occupancy[t_idx]
+            can_place = True
+            for (osc, oec) in occupied:
+                if start < oec and end_frame > osc:
+                    can_place = False
+                    break
+            if can_place:
+                target_track_idx = t_idx
+                break
+        
+        if target_track_idx is None:
+            # 新規トラック
+            print(f"➕ 新規トラック作成: {text[:5]}...")
+            timeline.AddTrack("audio")
+            new_idx = timeline.GetTrackCount("audio")
+            track_name = f"{TARGET_AUDIO_TRACK_NAME} {new_idx}" 
+            timeline.SetTrackName("audio", new_idx, track_name)
+            
+            track_occupancy[new_idx] = []
+            target_track_idx = new_idx
+        
+        track_occupancy[target_track_idx].append((start, end_frame))
+        
+        clip_entry = {
+            "mediaPoolItem": media_item,
+            "startFrame": 0,
+            "endFrame": audio_duration,
+            "trackIndex": target_track_idx,
+            "recordFrame": start
+        }
+        clips_to_append.append(clip_entry)
+
+    # 4. 配置実行
+    if clips_to_append:
+        print(f"🎞️ {len(clips_to_append)} 個のクリップをタイムラインに追加中...")
+        mediapool.AppendToTimeline(clips_to_append)
+        print("🎉 配置完了！")
+    else:
+        print("🍵 新規配置なし。全て最新だよ！")
+
+    print("🎉 全処理完了！！ だーりん、賢く更新できたよっ！褒めて♡")
 
 if __name__ == "__main__":
     main()
